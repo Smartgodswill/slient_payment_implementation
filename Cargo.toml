@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "sp_wallet"
-crate-type = ["cdylib"]  # This makes Rust produce a C-compatible .so library
+crate-type = ["staticlib","cdylib"]  # This makes Rust produce a C-compatible .so library
 
 
 [dependencies]
@@ -19,4 +19,5 @@ hex = "0.4"
 base64 = "0.21"
 bdk = "0.30"
 sha2 = "0.10"
+psbt = "0.10.2"
 
