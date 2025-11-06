@@ -5,19 +5,23 @@ edition = "2021"
 
 [lib]
 name = "sp_wallet"
-crate-type = ["staticlib","cdylib"]  # This makes Rust produce a C-compatible .so library
-
+crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 bitcoin = "0.30"
-bip39 = "1.2"
+bip39 = "1.0.2"
 secp256k1 = { version = "0.27", features = ["rand-std"] }
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
-base64 = "0.21"
-bdk = "0.30"
+base58 = "0.2"  # For future base58 if needed
 sha2 = "0.10"
-psbt = "0.10.2"
+bdk = "0.30"  # Match bitcoin version to avoid conflicts
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

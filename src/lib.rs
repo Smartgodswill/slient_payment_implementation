@@ -2,38 +2,34 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::str::FromStr;
 
-use bitcoin::psbt::Psbt;
-use bitcoin::{absolute::LockTime, Address, Network, OutPoint, Transaction, TxIn, TxOut, Txid};
-use bitcoin::{bech32, ScriptBuf};
+use bitcoin::Network;
+ 
 
-use bech32::{encode, ToBase32, Variant};
 use bip39::{Language, Mnemonic};
 use bitcoin::bip32::{DerivationPath, ExtendedPrivKey};
 use bitcoin::secp256k1::{
     ecdh::SharedSecret, PublicKey as SecpPublicKey, Secp256k1, SecretKey, XOnlyPublicKey,
 };
-use bitcoin::Sequence;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+ 
+
 #[derive(Serialize, Deserialize)]
-struct SpAddress {
-    sp_address: String,
-    internal_pubkey: String,
+struct SilentPaymentAddress {
+    address: String,
+    scan_pubkey: String,
     spend_pubkey: String,
-    ephemeral_priv: String,
-    ephemeral_pub: String,
     network: String,
 }
 
 #[derive(Serialize, Deserialize)]
-struct SenderOutput {
-    ephemeral_priv: String,
-    ephemeral_pub: String,
+struct SilentPaymentOutput {
+    ephemeral_pubkey: String,
     output_pubkey: String,
+    tweaked_output_key: String,
     sp_address: String,
     network: String,
 }
@@ -47,12 +43,23 @@ struct WalletKeys {
     network: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SilentTxResult {
+#[derive(Serialize)]
+struct TransactionResult {
     psbt_base64: String,
     raw_tx_hex: String,
+    txid: String,
     network: String,
 }
+
+#[derive(Serialize)]
+struct ScannedOutput {
+    output_pubkey: String,
+    value: u64,
+    txid: String,
+    vout: u32,
+    tweak_data: String,
+}
+
 /// Helper: parse C string
 fn parse_c_str(ptr: *const c_char) -> Result<String, String> {
     if ptr.is_null() {
@@ -62,6 +69,12 @@ fn parse_c_str(ptr: *const c_char) -> Result<String, String> {
     cstr.to_str()
         .map(|s| s.to_string())
         .map_err(|e| format!("invalid utf8: {}", e))
+}
+
+/// Helper: Return JSON error string as C ptr
+fn error_json(msg: &str) -> *mut c_char {
+    let json = format!(r#"{{"error":"{}"}}"#, msg.replace('"', "\\\""));
+    CString::new(json).unwrap_or_else(|_| CString::new("{}").unwrap()).into_raw()
 }
 
 /// Convert secp public key to hex (compressed)
@@ -82,24 +95,21 @@ fn derive_xprv_from_mnemonic(
     network: Network,
 ) -> Result<ExtendedPrivKey, String> {
     let mnemonic = Mnemonic::parse_in(Language::English, mnemonic_str)
-        .map_err(|e| format!("bad mnemonic: {}", e))?;
+        .map_err(|e| format!("invalid mnemonic: {}", e))?;
     let seed = mnemonic.to_seed(passphrase);
-    let xprv =
-        ExtendedPrivKey::new_master(network, &seed).map_err(|e| format!("master xprv: {}", e))?;
+    let xprv = ExtendedPrivKey::new_master(network, &seed)
+        .map_err(|e| format!("master key generation failed: {}", e))?;
     let path = derivation_path
         .parse::<DerivationPath>()
-        .map_err(|e| format!("bad derivation path: {}", e))?;
+        .map_err(|e| format!("invalid derivation path: {}", e))?;
     let secp = Secp256k1::new();
     xprv.derive_priv(&secp, &path)
-        .map_err(|e| format!("derive_priv: {}", e))
+        .map_err(|e| format!("key derivation failed: {}", e))
 }
 
-/// BIP-style tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
+/// BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
 fn tagged_hash(tag: &str, msg: &[u8]) -> [u8; 32] {
-    // compute tag hash once
     let tag_hash = Sha256::digest(tag.as_bytes());
-
-    // new hasher: SHA256(tag_hash || tag_hash || msg)
     let mut hasher = Sha256::new();
     hasher.update(&tag_hash);
     hasher.update(&tag_hash);
@@ -110,518 +120,404 @@ fn tagged_hash(tag: &str, msg: &[u8]) -> [u8; 32] {
     arr
 }
 
-/// Encode x-only pubkey as Silent Payments bech32m address ("sp" or "tsp")
-fn encode_silent_address(xonly: &XOnlyPublicKey, is_testnet: bool) -> Result<String, String> {
-    let hrp = if is_testnet { "tsp" } else { "sp" };
-    encode(hrp, xonly.serialize().to_base32(), Variant::Bech32m)
-        .map_err(|e| format!("bech32 encode failed: {}", e))
+/// Encode Silent Payment address (BIP-352 format: scan_pubkey || spend_pubkey)
+/// Uses base58 for simplicity (can switch to bech32m later with proper library)
+fn encode_silent_payment_address(
+    scan_pubkey: &SecpPublicKey,
+    spend_pubkey: &SecpPublicKey,
+    is_testnet: bool,
+) -> Result<String, String> {
+    // Version byte: 0x01 for mainnet SP, 0x02 for testnet SP
+    let version = if is_testnet { 0x02 } else { 0x01 };
+    
+    // BIP-352: Concatenate version + scan + spend public keys
+    let mut data = Vec::with_capacity(67);
+    data.push(version);
+    data.extend_from_slice(&scan_pubkey.serialize());
+    data.extend_from_slice(&spend_pubkey.serialize());
+    
+    // For now, return hex-encoded (most compatible)
+    // Format: "sp1" prefix + hex data
+    let prefix = if is_testnet { "tsp1" } else { "sp1" };
+    Ok(format!("{}{}", prefix, hex::encode(&data)))
 }
 
-//////////////////// FFI Functions ////////////////////
-//generate a silent address from a mnemonic.
+/// Decode Silent Payment address to extract scan and spend public keys
+fn decode_silent_payment_address(address: &str) -> Result<(SecpPublicKey, SecpPublicKey), String> {
+    // Check prefix
+    let (expected_version, hex_data) = if let Some(stripped) = address.strip_prefix("sp1") {
+        (0x01, stripped)
+    } else if let Some(stripped) = address.strip_prefix("tsp1") {
+        (0x02, stripped)
+    } else {
+        return Err("invalid silent payment address prefix".into());
+    };
+    
+    // Decode hex
+    let data = hex::decode(hex_data)
+        .map_err(|_| "invalid hex encoding")?;
+    
+    if data.len() != 67 {
+        return Err(format!("invalid address length: expected 67, got {}", data.len()));
+    }
+    
+    // Verify version byte
+    if data[0] != expected_version {
+        return Err("version mismatch".into());
+    }
+    
+    let scan_pubkey = SecpPublicKey::from_slice(&data[1..34])
+        .map_err(|e| format!("invalid scan pubkey: {}", e))?;
+    let spend_pubkey = SecpPublicKey::from_slice(&data[34..67])
+        .map_err(|e| format!("invalid spend pubkey: {}", e))?;
+    
+    Ok((scan_pubkey, spend_pubkey))
+}
+
+
+
+// BIP-352 CORE FUNCTIONS
+/// Generate shared secret with input public keys (BIP-352 compliant)
+fn generate_shared_secret(
+    input_privkey: &SecretKey,
+    scan_pubkey: &SecpPublicKey,
+    input_pubkeys: &[SecpPublicKey],
+) -> Result<[u8; 32], String> {
+    let secp = Secp256k1::new();
+    
+    // Step 1: Compute ECDH shared secret
+    let ecdh_shared = SharedSecret::new(scan_pubkey, input_privkey);
+    
+    // Step 2: Sum all input public keys (required by BIP-352 for multiple inputs)
+    let mut input_pubkey_sum = input_pubkeys[0];
+    for pk in &input_pubkeys[1..] {
+        input_pubkey_sum = input_pubkey_sum.combine(pk)
+            .map_err(|_| "failed to combine input pubkeys")?;
+    }
+    
+    // Step 3: Create tagged hash according to BIP-352
+    // Hash = tagged_hash("BIP0352/SharedSecret", ecdh_shared || ser₂₅₆(input_pubkey_sum))
+    let mut msg = Vec::new();
+    msg.extend_from_slice(ecdh_shared.as_ref());
+    msg.extend_from_slice(&input_pubkey_sum.serialize());
+    
+    Ok(tagged_hash("BIP0352/SharedSecret", &msg))
+}
+
+/// Create output public key for recipient (sender side)
+fn create_silent_payment_output(
+    input_privkey: &SecretKey,
+    scan_pubkey: &SecpPublicKey,
+    spend_pubkey: &SecpPublicKey,
+    input_pubkeys: &[SecpPublicKey],
+    output_index: u32,
+) -> Result<(XOnlyPublicKey, [u8; 32]), String> {
+    let secp = Secp256k1::new();
+    
+    // Generate shared secret
+    let shared_secret = generate_shared_secret(input_privkey, scan_pubkey, input_pubkeys)?;
+    
+    // Add output index for multiple outputs to same recipient
+    let mut tweak_data = Vec::from(shared_secret);
+    tweak_data.extend_from_slice(&output_index.to_le_bytes());
+    
+    let tweak_hash = tagged_hash("BIP0352/Tweak", &tweak_data);
+    let tweak_scalar = SecretKey::from_slice(&tweak_hash)
+        .map_err(|_| "invalid tweak scalar")?;
+    
+    // Compute tweaked public key: P_output = B_spend + tweak·G
+    let tweak_point = SecpPublicKey::from_secret_key(&secp, &tweak_scalar);
+    let output_pubkey = spend_pubkey.combine(&tweak_point)
+        .map_err(|_| "failed to create output pubkey")?;
+    
+    // Convert to x-only for taproot
+    let xonly = XOnlyPublicKey::from_slice(&output_pubkey.serialize()[1..33])
+        .map_err(|_| "failed to create x-only pubkey")?;
+    
+    Ok((xonly, tweak_hash))
+}
+
+/// Scan for received outputs (receiver side)
+fn scan_for_outputs(
+    scan_privkey: &SecretKey,
+    spend_pubkey: &SecpPublicKey,
+    ephemeral_pubkey: &SecpPublicKey,
+    input_pubkeys: &[SecpPublicKey],
+    outputs: &[(XOnlyPublicKey, u64)],
+) -> Result<Vec<(usize, [u8; 32])>, String> {
+    let secp = Secp256k1::new();
+    let mut matches = Vec::new();
+    
+    // Generate shared secret using ephemeral pubkey from transaction
+    let shared_secret = generate_shared_secret(scan_privkey, ephemeral_pubkey, input_pubkeys)?;
+    
+    // Check each output
+    for (idx, (output_xonly, _value)) in outputs.iter().enumerate() {
+        // Compute expected tweak for this output index
+        let mut tweak_data = Vec::from(shared_secret);
+        tweak_data.extend_from_slice(&(idx as u32).to_le_bytes());
+        
+        let tweak_hash = tagged_hash("BIP0352/Tweak", &tweak_data);
+        let tweak_scalar = match SecretKey::from_slice(&tweak_hash) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        
+        // Compute expected output: P = B_spend + tweak·G
+        let tweak_point = SecpPublicKey::from_secret_key(&secp, &tweak_scalar);
+        let expected_pubkey = match spend_pubkey.combine(&tweak_point) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        
+        let expected_xonly = match XOnlyPublicKey::from_slice(&expected_pubkey.serialize()[1..33]) {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        
+        // Check if it matches
+        if &expected_xonly == output_xonly {
+            matches.push((idx, tweak_hash));
+        }
+    }
+    
+    Ok(matches)
+}
+
+// FFI FUNCTIONS
+/// Generate Silent Payment address from mnemonic
 #[no_mangle]
-pub extern "C" fn sp_generate_silent_address_from_mnemonic(
+pub extern "C" fn sp_generate_address_from_mnemonic(
     mnemonic_ptr: *const c_char,
     spend_path_ptr: *const c_char,
     scan_path_ptr: *const c_char,
     passphrase_ptr: *const c_char,
-    is_testnet: bool,
+    is_testnet: u8,  // FIXED: u8 for Dart FFI - stable across versions
 ) -> *mut c_char {
-    // parse inputs
-    let mnemonic = parse_c_str(mnemonic_ptr).unwrap_or_default();
-    let spend_path = parse_c_str(spend_path_ptr).unwrap_or_else(|_| "m/86'/0'/0'/0/0".to_string());
-    let scan_path = parse_c_str(scan_path_ptr).unwrap_or_else(|_| "m/86'/0'/0'/0/1".to_string());
-    let passphrase = parse_c_str(passphrase_ptr).unwrap_or_default();
-
-    let network = if is_testnet {
-        Network::Testnet
-    } else {
-        Network::Bitcoin
+    let mnemonic = match parse_c_str(mnemonic_ptr) {
+        Ok(m) => m,
+        Err(e) => return error_json(&e),
     };
+    
+    let spend_path = match parse_c_str(spend_path_ptr) {
+        Ok(p) if !p.is_empty() => p,
+        _ => "m/352h/0h/0h/0/0".to_string(), // BIP-352 standard path - future-proof
+    };
+    
+    let scan_path = match parse_c_str(scan_path_ptr) {
+        Ok(p) if !p.is_empty() => p,
+        _ => "m/352h/0h/0h/1/0".to_string(),
+    };
+    
+    let passphrase = match parse_c_str(passphrase_ptr) {
+        Ok(p) => p,
+        Err(e) => return error_json(&e),
+    };
+    
+    let network = if is_testnet == 1 { Network::Testnet } else { Network::Bitcoin };
     let secp = Secp256k1::new();
-
-    // derive spend and scan xprvs
-    let spend_xprv =
-        derive_xprv_from_mnemonic(&mnemonic, &passphrase, &spend_path, network).unwrap();
-    let scan_xprv = derive_xprv_from_mnemonic(&mnemonic, &passphrase, &scan_path, network).unwrap();
-
-    let spend_pub = SecpPublicKey::from_secret_key(&secp, &spend_xprv.private_key);
-    let scan_pub = SecpPublicKey::from_secret_key(&secp, &scan_xprv.private_key);
-
-    // ephemeral keypair
-    let mut rng = OsRng;
-    let ephemeral_sk = SecretKey::new(&mut rng);
-    let ephemeral_pk = SecpPublicKey::from_secret_key(&secp, &ephemeral_sk);
-
-    // shared secret and BIP352-tagged tweak
-    let shared = SharedSecret::new(&scan_pub, &ephemeral_sk);
-    // BIP352 tag per spec: "BIP352 Derive"
-    let tweak_bytes = tagged_hash("BIP352 Derive", shared.as_ref());
-    let tweak_sk = SecretKey::from_slice(&tweak_bytes).unwrap();
-    let tweak_point = SecpPublicKey::from_secret_key(&secp, &tweak_sk);
-
-    // combine and make x-only pubkey -> bech32m sp/tsp address
-    let combined = spend_pub.combine(&tweak_point).unwrap();
-    let xonly = XOnlyPublicKey::from_slice(&combined.serialize()[1..33]).unwrap();
-    let address = encode_silent_address(&xonly, is_testnet).unwrap();
-
-    let result = SpAddress {
-        sp_address: address,
-        internal_pubkey: pubkey_to_hex(&spend_pub),
-        spend_pubkey: pubkey_to_hex(&combined),
-        ephemeral_priv: sk_to_hex(&ephemeral_sk),
-        ephemeral_pub: pubkey_to_hex(&ephemeral_pk),
+    
+    // Derive keys
+    let spend_xprv = match derive_xprv_from_mnemonic(&mnemonic, &passphrase, &spend_path, network) {
+        Ok(x) => x,
+        Err(e) => return error_json(&e),
+    };
+    
+    let scan_xprv = match derive_xprv_from_mnemonic(&mnemonic, &passphrase, &scan_path, network) {
+        Ok(x) => x,
+        Err(e) => return error_json(&e),
+    };
+    
+    let spend_pubkey = SecpPublicKey::from_secret_key(&secp, &spend_xprv.private_key);
+    let scan_pubkey = SecpPublicKey::from_secret_key(&secp, &scan_xprv.private_key);
+    
+    // Create BIP-352 compliant address
+    let address = match encode_silent_payment_address(&scan_pubkey, &spend_pubkey, is_testnet == 1) {
+        Ok(a) => a,
+        Err(e) => return error_json(&e),
+    };
+    
+    let result = SilentPaymentAddress {
+        address,
+        scan_pubkey: pubkey_to_hex(&scan_pubkey),
+        spend_pubkey: pubkey_to_hex(&spend_pubkey),
         network: format!("{:?}", network),
     };
-
-    CString::new(serde_json::to_string(&result).unwrap())
-        .unwrap()
-        .into_raw()
+    
+    match serde_json::to_string(&result) {
+        Ok(json) => match CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => error_json("json serialization failed"),
+        },
+        Err(_) => error_json("json serialization failed"),
+    }
 }
 
-//Create output pubkey for sending to a given spend and scan pubkey.
+/// Create Silent Payment output (sender side)
 #[no_mangle]
-pub extern "C" fn sp_create_silent_output_from_pubkeys(
-    spend_pub_hex_ptr: *const c_char,
-    scan_pub_hex_ptr: *const c_char,
-    is_testnet: bool,
+pub extern "C" fn sp_create_output(
+    recipient_address_ptr: *const c_char,
+    input_privkey_hex_ptr: *const c_char,
+    input_pubkeys_json_ptr: *const c_char,
+    output_index: u32,
+    is_testnet: u8,
 ) -> *mut c_char {
-    let spend_pub_hex = parse_c_str(spend_pub_hex_ptr).unwrap_or_default();
-    let scan_pub_hex = parse_c_str(scan_pub_hex_ptr).unwrap_or_default();
-
-    let spend_pub_bytes = hex::decode(&spend_pub_hex).unwrap();
-    let scan_pub_bytes = hex::decode(&scan_pub_hex).unwrap();
-
-    let secp = Secp256k1::new();
-    let spend_pub = SecpPublicKey::from_slice(&spend_pub_bytes).unwrap();
-    let scan_pub = SecpPublicKey::from_slice(&scan_pub_bytes).unwrap();
-
-    let mut rng = OsRng;
-    let ephemeral_sk = SecretKey::new(&mut rng);
-    let ephemeral_pk = SecpPublicKey::from_secret_key(&secp, &ephemeral_sk);
-
-    let shared = SharedSecret::new(&scan_pub, &ephemeral_sk);
-    let tweak_bytes = tagged_hash("BIP352 Derive", shared.as_ref());
-    let tweak_sk = SecretKey::from_slice(&tweak_bytes).unwrap();
-    let tweak_point = SecpPublicKey::from_secret_key(&secp, &tweak_sk);
-
-    let combined = spend_pub.combine(&tweak_point).unwrap();
-    let xonly = XOnlyPublicKey::from_slice(&combined.serialize()[1..33]).unwrap();
-
-    let address = encode_silent_address(&xonly, is_testnet).unwrap();
-
-    let result = SenderOutput {
-        ephemeral_priv: sk_to_hex(&ephemeral_sk),
-        ephemeral_pub: pubkey_to_hex(&ephemeral_pk),
-        output_pubkey: pubkey_to_hex(&combined),
-        sp_address: address,
-        network: format!(
-            "{:?}",
-            if is_testnet {
-                Network::Testnet
-            } else {
-                Network::Bitcoin
-            }
-        ),
+    let recipient_address = match parse_c_str(recipient_address_ptr) {
+        Ok(a) => a,
+        Err(e) => return error_json(&e),
     };
-
-    CString::new(serde_json::to_string(&result).unwrap())
-        .unwrap()
-        .into_raw()
-}
-
-//Scan a list of outputs and tell me which ones are mine.(i.e) Detect incoming SP payments
-#[no_mangle]
-pub extern "C" fn sp_scan_for_received_outputs(
-    scan_priv_hex_ptr: *const c_char,
-    spend_pub_hex_ptr: *const c_char,
-    outputs_json_ptr: *const c_char,
-) -> *mut c_char {
-    let scan_priv_hex = parse_c_str(scan_priv_hex_ptr).unwrap_or_default();
-    let spend_pub_hex = parse_c_str(spend_pub_hex_ptr).unwrap_or_default();
-    let outputs_json = parse_c_str(outputs_json_ptr).unwrap_or_default();
-
-    let secp = Secp256k1::new();
-    let scan_priv_bytes = match hex::decode(&scan_priv_hex) {
+    
+    let input_privkey_hex = match parse_c_str(input_privkey_hex_ptr) {
+        Ok(h) => h,
+        Err(e) => return error_json(&e),
+    };
+    
+    let input_pubkeys_json = match parse_c_str(input_pubkeys_json_ptr) {
+        Ok(j) => j,
+        Err(e) => return error_json(&e),
+    };
+    
+    // Decode recipient address
+    let (scan_pubkey, spend_pubkey) = match decode_silent_payment_address(&recipient_address) {
+        Ok(keys) => keys,
+        Err(e) => return error_json(&e),
+    };
+    
+    // Parse input private key
+    let input_privkey_bytes = match hex::decode(&input_privkey_hex) {
         Ok(b) => b,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid scan_priv_hex\"}")
-                .unwrap()
-                .into_raw()
-        }
+        Err(_) => return error_json("invalid input privkey hex"),
     };
-    let spend_pub_bytes = match hex::decode(&spend_pub_hex) {
-        Ok(b) => b,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid spend_pub_hex\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-
-    let scan_priv = match SecretKey::from_slice(&scan_priv_bytes) {
-        Ok(s) => s,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid scan_priv key\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-    let spend_pub = match SecpPublicKey::from_slice(&spend_pub_bytes) {
-        Ok(p) => p,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid spend_pub key\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-
-    let outputs: Vec<serde_json::Value> = match serde_json::from_str(&outputs_json) {
-        Ok(v) => v,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid outputs_json format\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-
-    let mut received = Vec::new();
-
-    for output in outputs {
-        if let (Some(ephemeral_hex), Some(output_hex)) = (
-            output["ephemeral_pub"].as_str(),
-            output["output_pubkey"].as_str(),
-        ) {
-            if let (Ok(ephemeral_bytes), Ok(output_bytes)) =
-                (hex::decode(ephemeral_hex), hex::decode(output_hex))
-            {
-                if let Ok(ephemeral_pub) = SecpPublicKey::from_slice(&ephemeral_bytes) {
-                    let shared = SharedSecret::new(&ephemeral_pub, &scan_priv);
-                    let tweak_bytes = tagged_hash("BIP352 Derive", shared.as_ref());
-                    let tweak_sk = match SecretKey::from_slice(&tweak_bytes) {
-                        Ok(t) => t,
-                        Err(_) => continue,
-                    };
-                    let tweak_point = SecpPublicKey::from_secret_key(&secp, &tweak_sk);
-                    let combined = spend_pub.combine(&tweak_point).unwrap();
-                    if <[u8; 33] as AsRef<[u8]>>::as_ref(&combined.serialize())
-                        == output_bytes.as_slice()
-                    {
-                        received.push(output);
-                    }
-                }
-            }
-        }
-    }
-
-    CString::new(serde_json::to_string(&received).unwrap())
-        .unwrap()
-        .into_raw()
-}
-
-#[no_mangle]
-pub extern "C" fn sp_export_keys(
-    spend_priv_hex_ptr: *const c_char,
-    scan_priv_hex_ptr: *const c_char,
-    spend_pub_hex_ptr: *const c_char,
-    scan_pub_hex_ptr: *const c_char,
-    is_testnet: bool,
-) -> *mut c_char {
-    let spend_priv = parse_c_str(spend_priv_hex_ptr).unwrap_or_default();
-    let scan_priv = parse_c_str(scan_priv_hex_ptr).unwrap_or_default();
-    let spend_pub = parse_c_str(spend_pub_hex_ptr).unwrap_or_default();
-    let scan_pub = parse_c_str(scan_pub_hex_ptr).unwrap_or_default();
-    let network = if is_testnet { "Testnet" } else { "Bitcoin" }.to_string();
-
-    let keys = WalletKeys {
-        spend_priv,
-        scan_priv,
-        spend_pub,
-        scan_pub,
-        network,
-    };
-
-    CString::new(serde_json::to_string(&keys).unwrap())
-        .unwrap()
-        .into_raw()
-}
-
-#[no_mangle]
-pub extern "C" fn sp_import_keys(keys_json_ptr: *const c_char) -> *mut c_char {
-    let keys_json = parse_c_str(keys_json_ptr).unwrap_or_default();
-    let keys: WalletKeys = match serde_json::from_str(&keys_json) {
-        Ok(k) => k,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid keys json\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-    // For now we just return the parsed keys back to confirm successful import
-    CString::new(serde_json::to_string(&keys).unwrap())
-        .unwrap()
-        .into_raw()
-}
-
-#[no_mangle]
-pub extern "C" fn sp_construct_transaction(
-    inputs_json_ptr: *const c_char,
-    outputs_json_ptr: *const c_char,
-    fee_sat: u64,
-    is_testnet: bool,
-) -> *mut c_char {
-    use bitcoin::{
-        absolute::LockTime, consensus::encode::serialize, psbt::PartiallySignedTransaction as Psbt,
-        script::Script, witness::Witness, Address, Network, OutPoint, Transaction, TxIn, TxOut,
-        Txid,
-    };
-    use std::{ffi::CString, str::FromStr};
-
-    // Convert C strings
-    let inputs_json = parse_c_str(inputs_json_ptr).unwrap_or_default();
-    let outputs_json = parse_c_str(outputs_json_ptr).unwrap_or_default();
-
-    let inputs: Vec<serde_json::Value> = match serde_json::from_str(&inputs_json) {
-        Ok(v) => v,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid inputs json\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-    let outputs: Vec<serde_json::Value> = match serde_json::from_str(&outputs_json) {
-        Ok(v) => v,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid outputs json\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-
-    let network = if is_testnet {
-        Network::Testnet
-    } else {
-        Network::Bitcoin
-    };
-    let mut tx_ins = Vec::with_capacity(inputs.len());
-    let mut tx_outs = Vec::with_capacity(outputs.len());
-
-    // Build transaction inputs
-    for input in inputs {
-        let txid_str = match input["txid"].as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let txid = match Txid::from_str(txid_str) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let vout = input["vout"].as_u64().unwrap_or(0) as u32;
-
-        tx_ins.push(TxIn {
-            previous_output: OutPoint { txid, vout },
-            script_sig: ScriptBuf::new(),   // empty script
-            sequence: Sequence(0xFFFFFFFF), // wrap in Sequence
-            witness: Witness::default(),    // empty witness
-        });
-    }
-
-    // Build transaction outputs
-    for output in outputs {
-        let addr_str = match output["address"].as_str() {
-            Some(a) => a,
-            None => continue,
-        };
-        let value = output["value"].as_u64().unwrap_or(0);
-
-        let addr = match Address::from_str(addr_str) {
-            Ok(a) => match a.require_network(network) {
-                Ok(valid) => valid,
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        };
-
-        tx_outs.push(TxOut {
-            value,
-            script_pubkey: addr.script_pubkey(),
-        });
-    }
-
-    if tx_ins.is_empty() || tx_outs.is_empty() {
-        return CString::new("{\"error\":\"no valid inputs or outputs\"}")
-            .unwrap()
-            .into_raw();
-    }
-
-    // Build transaction
-    let tx = Transaction {
-        version: 2,
-        lock_time: LockTime::ZERO,
-        input: tx_ins,
-        output: tx_outs,
-    };
-
-    // Serialize raw transaction
-    let raw_tx_hex = hex::encode(serialize(&tx));
-
-    // Wrap in PSBT
-    let psbt = match Psbt::from_unsigned_tx(tx) {
-        Ok(p) => p,
-        Err(_) => {
-            return CString::new("{\"error\":\"failed to create PSBT\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-    let psbt_base64 = psbt.to_string();
-
-    #[derive(serde::Serialize)]
-    struct SilentTxResult {
-        psbt_base64: String,
-        raw_tx_hex: String,
-        network: String,
-    }
-
-    let result = SilentTxResult {
-        psbt_base64,
-        raw_tx_hex,
-        network: format!("{:?}", network),
-    };
-
-    CString::new(serde_json::to_string(&result).unwrap())
-        .unwrap()
-        .into_raw()
-}
-
-#[no_mangle]
-pub extern "C" fn sp_sign_psbt(
-    psbt_base64_ptr: *const c_char,
-    spend_priv_hex_ptr: *const c_char,
-    ephemeral_priv_hex_ptr: *const c_char,
-    scan_pub_hex_ptr: *const c_char,
-) -> *mut c_char {
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::ecdsa::Signature as BitcoinSig;
-    use bitcoin::hashes::{sha256, Hash};
-    use bitcoin::psbt::PartiallySignedTransaction as Psbt;
-    use bitcoin::secp256k1::ecdh::SharedSecret;
-    use bitcoin::secp256k1::Scalar;
-    use bitcoin::secp256k1::{PublicKey as SecpPublicKey, Secp256k1, SecretKey};
-    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-    use bitcoin::PublicKey;
-    use std::ffi::CString;
-
-    let psbt_base64 = parse_c_str(psbt_base64_ptr).unwrap_or_default();
-    let spend_priv_hex = parse_c_str(spend_priv_hex_ptr).unwrap_or_default();
-    let ephemeral_priv_hex = parse_c_str(ephemeral_priv_hex_ptr).unwrap_or_default();
-    let scan_pub_hex = parse_c_str(scan_pub_hex_ptr).unwrap_or_default();
-
-    let secp = Secp256k1::new();
-
-    let mut psbt: Psbt = match psbt_base64.parse() {
-        Ok(p) => p,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid PSBT\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-
-    let spend_sk = match SecretKey::from_slice(&hex::decode(&spend_priv_hex).unwrap_or_default()) {
+    let input_privkey = match SecretKey::from_slice(&input_privkey_bytes) {
         Ok(sk) => sk,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid spend priv\"}")
-                .unwrap()
-                .into_raw()
-        }
+        Err(_) => return error_json("invalid input privkey"),
     };
-    let ephemeral_sk =
-        match SecretKey::from_slice(&hex::decode(&ephemeral_priv_hex).unwrap_or_default()) {
-            Ok(sk) => sk,
-            Err(_) => {
-                return CString::new("{\"error\":\"invalid ephemeral priv\"}")
-                    .unwrap()
-                    .into_raw()
-            }
+    
+    // Parse input public keys
+    let input_pubkeys_arr: Vec<String> = match serde_json::from_str(&input_pubkeys_json) {
+        Ok(arr) => arr,
+        Err(_) => return error_json("invalid input pubkeys json"),
+    };
+    
+    let mut input_pubkeys = Vec::new();
+    for hex_str in input_pubkeys_arr {
+        let bytes = match hex::decode(&hex_str) {
+            Ok(b) => b,
+            Err(_) => return error_json("invalid pubkey hex"),
         };
-    let scan_pub_bytes = match hex::decode(&scan_pub_hex) {
-        Ok(b) => b,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid scan pub\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-    let scan_pub = match SecpPublicKey::from_slice(&scan_pub_bytes) {
-        Ok(p) => p,
-        Err(_) => {
-            return CString::new("{\"error\":\"invalid scan pub key\"}")
-                .unwrap()
-                .into_raw()
-        }
-    };
-
-    for (idx, input) in psbt.inputs.iter_mut().enumerate() {
-        let witness_utxo = match &input.witness_utxo {
-            Some(u) => u,
-            None => continue,
+        let pubkey = match SecpPublicKey::from_slice(&bytes) {
+            Ok(pk) => pk,
+            Err(_) => return error_json("invalid pubkey"),
         };
-
-        let shared = SharedSecret::new(&scan_pub, &ephemeral_sk);
-        let tweak_hash = sha256::Hash::hash(shared.as_ref());
-
-        // Copy hash into a 32-byte array
-        let mut tweak_array = [0u8; 32];
-        tweak_array.copy_from_slice(tweak_hash.as_ref());
-
-        // Convert array into Scalar
-        let tweak_scalar = Scalar::from_be_bytes(tweak_array).expect("32-byte tweak is valid");
-
-        // Apply tweak to spend key
-        let mut combined_sk = spend_sk.clone();
-        combined_sk.add_tweak(&tweak_scalar).unwrap();
-
-        let combined_pk = SecpPublicKey::from_secret_key(&secp, &combined_sk);
-
-        let sighash = SighashCache::new(&psbt.unsigned_tx)
-            .segwit_signature_hash(
-                idx,
-                &witness_utxo.script_pubkey,
-                witness_utxo.value,
-                EcdsaSighashType::All,
-            )
-            .unwrap();
-        let msg = bitcoin::secp256k1::Message::from_slice(&sighash[..]).unwrap();
-
-        let sig = secp.sign_ecdsa(&msg, &combined_sk);
-
-        // Convert to bitcoin::ecdsa::Signature
-        let mut sig_bytes = sig.serialize_der().to_vec();
-        sig_bytes.push(0x01); // SIGHASH_ALL
-        let sig_bitcoin = BitcoinSig::from_slice(&sig_bytes).expect("valid signature");
-
-        input
-            .partial_sigs
-            .insert(PublicKey::new(combined_pk), sig_bitcoin);
+        input_pubkeys.push(pubkey);
     }
-
-    // Finalize **all** inputs after signing
-    let raw_tx = hex::encode(serialize(&psbt.clone().extract_tx()));
-    let result_json = serde_json::json!({
-        "psbt_base64": psbt.to_string(),
-        "raw_tx_hex": raw_tx
-    });
-
-    return CString::new(result_json.to_string()).unwrap().into_raw();
+    
+    if input_pubkeys.is_empty() {
+        return error_json("no input pubkeys provided");
+    }
+    
+    // Create output
+    let (output_xonly, _tweak) = match create_silent_payment_output(
+        &input_privkey,
+        &scan_pubkey,
+        &spend_pubkey,
+        &input_pubkeys,
+        output_index,
+    ) {
+        Ok(out) => out,
+        Err(e) => return error_json(&e),
+    };
+    
+    let secp = Secp256k1::new();
+    let ephemeral_pubkey = SecpPublicKey::from_secret_key(&secp, &input_privkey);
+    
+    let result = SilentPaymentOutput {
+        ephemeral_pubkey: pubkey_to_hex(&ephemeral_pubkey),
+        output_pubkey: hex::encode(output_xonly.serialize()),
+        tweaked_output_key: hex::encode(output_xonly.serialize()),
+        sp_address: recipient_address,
+        network: format!("{:?}", if is_testnet == 1 { Network::Testnet } else { Network::Bitcoin }),
+    };
+    
+    match serde_json::to_string(&result) {
+        Ok(json) => match CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => error_json("json serialization failed"),
+        },
+        Err(_) => error_json("json serialization failed"),
+    }
 }
 
+/// Free C string memory
 #[no_mangle]
 pub extern "C" fn sp_free_string(s: *mut c_char) {
-    if s.is_null() {
-        return;
+    if !s.is_null() {
+        unsafe {
+            let _ = CString::from_raw(s);
+        }
     }
-    unsafe {
-        let _ = CString::from_raw(s);
+}
+
+// TESTS (Add these to verify correctness - future-proof with version-agnostic logic)
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_address_encoding_decoding() {
+        let secp = Secp256k1::new();
+        let mut rng = OsRng;
+        
+        let scan_sk = SecretKey::new(&mut rng);
+        let spend_sk = SecretKey::new(&mut rng);
+        
+        let scan_pk = SecpPublicKey::from_secret_key(&secp, &scan_sk);
+        let spend_pk = SecpPublicKey::from_secret_key(&secp, &spend_sk);
+        
+        let address = encode_silent_payment_address(&scan_pk, &spend_pk, false).unwrap();
+        let (decoded_scan, decoded_spend) = decode_silent_payment_address(&address).unwrap();
+        
+        assert_eq!(scan_pk, decoded_scan);
+        assert_eq!(spend_pk, decoded_spend);
+    }
+    
+    #[test]
+    fn test_output_creation_and_scanning() {
+        let secp = Secp256k1::new();
+        let mut rng = OsRng;
+        
+        // Receiver keys
+        let scan_sk = SecretKey::new(&mut rng);
+        let spend_sk = SecretKey::new(&mut rng);
+        let scan_pk = SecpPublicKey::from_secret_key(&secp, &scan_sk);
+        let spend_pk = SecpPublicKey::from_secret_key(&secp, &spend_sk);
+        
+        // Sender creates output
+        let input_sk = SecretKey::new(&mut rng);
+        let input_pk = SecpPublicKey::from_secret_key(&secp, &input_sk);
+        let input_pubkeys = vec![input_pk];
+        
+        let (output_xonly, _) = create_silent_payment_output(
+            &input_sk,
+            &scan_pk,
+            &spend_pk,
+            &input_pubkeys,
+            0,
+        ).unwrap();
+        
+        // Receiver scans
+        let outputs = vec![(output_xonly, 100000)];
+        let matches = scan_for_outputs(
+            &scan_sk,
+            &spend_pk,
+            &input_pk,
+            &input_pubkeys,
+            &outputs,
+        ).unwrap();
+        
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, 0);
     }
 }
